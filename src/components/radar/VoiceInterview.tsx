@@ -35,7 +35,7 @@ export default function VoiceInterview(props: Props) {
   const [isMuted, setIsMuted] = useState(true);
   return (
     <ConversationProvider isMuted={isMuted} onMutedChange={setIsMuted}>
-      <VoiceCall {...props} resetMute={() => setIsMuted(true)} />
+      <VoiceCall {...props} resetMute={() => setIsMuted(true)} setMute={setIsMuted} />
     </ConversationProvider>
   );
 }
@@ -58,21 +58,36 @@ type CaptionWindow = Window & {
   webkitSpeechRecognition?: new () => CaptionRecognition;
 };
 
-function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMute: () => void }) {
+function VoiceCall({
+  app,
+  onUseText,
+  onFeedback,
+  resetMute,
+  setMute,
+}: Props & {
+  resetMute: () => void;
+  setMute: (muted: boolean) => void;
+}) {
   const [phase, setPhase] = useState<Phase>("ready");
   const [problem, setProblem] = useState<string | null>(null);
-  const [plan, setPlan] = useState<InterviewQuestion[]>([]);
   const [turns, setTurns] = useState<VoiceTurn[]>([]);
   const turnsRef = useRef<VoiceTurn[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<CaptionRecognition | null>(null);
   const activityTimerRef = useRef<number | null>(null);
+  const connectionTimerRef = useRef<number | null>(null);
+  const startAttemptRef = useRef(0);
   const [liveText, setLiveText] = useState("");
 
   function stopUserActivity() {
     if (activityTimerRef.current === null) return;
     window.clearInterval(activityTimerRef.current);
     activityTimerRef.current = null;
+  }
+
+  function stopConnectionTimer() {
+    if (connectionTimerRef.current !== null) window.clearTimeout(connectionTimerRef.current);
+    connectionTimerRef.current = null;
   }
 
   function stopCaptions() {
@@ -90,6 +105,12 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
   }
 
   const conversation = useConversation({
+    onConnect: () => {
+      if (connectionTimerRef.current === null) return;
+      stopConnectionTimer();
+      setProblem(null);
+      setPhase((p) => (p === "preparing" ? "live" : p));
+    },
     onMessage: ({ message, source }) => {
       const raw = message?.trim() ?? "";
       const text =
@@ -104,15 +125,21 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
       setTurns(turnsRef.current);
     },
     onDisconnect: () => {
+      stopConnectionTimer();
       stopUserActivity();
       stopCaptions();
       setLiveText("");
       resetMute();
-      setPhase((p) => (p === "live" || p === "preparing" ? "ended" : p));
+      setPhase((p) => (p === "live" ? "ended" : p === "preparing" ? "ready" : p));
     },
     onError: (message) => {
+      stopConnectionTimer();
       stopUserActivity();
-      setProblem(`Voice connection problem: ${message}`);
+      stopCaptions();
+      resetMute();
+      endSession();
+      setPhase((p) => (p === "preparing" ? "ready" : p === "live" ? "ended" : p));
+      setProblem(`Voice isn't available right now (${message}). You can continue in text mode.`);
     },
   });
 
@@ -140,6 +167,8 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
   const endSession = conversation.endSession;
   useEffect(
     () => () => {
+      startAttemptRef.current += 1;
+      stopConnectionTimer();
       stopUserActivity();
       stopCaptions();
       void endSession();
@@ -150,6 +179,8 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
   const answered = turns.filter((t) => t.role === "candidate").length;
 
   async function start() {
+    const attempt = ++startAttemptRef.current;
+    stopConnectionTimer();
     stopUserActivity();
     setProblem(null);
     resetMute();
@@ -160,7 +191,9 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
+      if (attempt !== startAttemptRef.current) return;
     } catch {
+      if (attempt !== startAttemptRef.current) return;
       setPhase("ready");
       setProblem(
         "Microphone access was blocked. Allow the microphone in your browser (icon in the address bar), or continue in text mode.",
@@ -170,13 +203,22 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
     try {
       // 2. signed URL first: if voice is not configured we do not create an interview
       const { signed_url } = await api.getVoiceSignedUrl();
+      if (attempt !== startAttemptRef.current) return;
       // 3. same plan as the text interview
       const started = await api.startInterview(app.id, "voice");
-      setPlan(started.plan);
+      if (attempt !== startAttemptRef.current) return;
       turnsRef.current = [];
       setTurns([]);
       const firstName = (app.snapshot?.cv.name ?? app.cv.name ?? "").split(" ")[0] || "there";
-      await conversation.startSession({
+      connectionTimerRef.current = window.setTimeout(() => {
+        stopConnectionTimer();
+        endSession();
+        resetMute();
+        setPhase("ready");
+        setProblem("The voice connection timed out. Try again or continue in text mode.");
+      }, 30000);
+      // The SDK returns void: onConnect, not this return value, signals readiness.
+      conversation.startSession({
         signedUrl: signed_url,
         dynamicVariables: {
           first_message: started.message,
@@ -186,9 +228,9 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
           questions: started.plan.map((q, i) => `${i + 1}. ${q.question}`).join("\n"),
         },
       });
-      conversation.setMuted(true);
-      setPhase("live");
     } catch (e) {
+      if (attempt !== startAttemptRef.current) return;
+      stopConnectionTimer();
       setPhase("ready");
       setProblem(
         `Voice isn't available right now (${e instanceof Error ? e.message : String(e)}). You can continue in text mode.`,
@@ -197,17 +239,18 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
   }
 
   function hangUp() {
+    stopConnectionTimer();
     stopUserActivity();
     stopCaptions();
     setLiveText("");
-    conversation.setMuted(true);
+    setMute(true);
     conversation.endSession();
     setPhase("ended");
   }
 
   function startAnswer() {
     if (phase !== "live" || conversation.isSpeaking || !conversation.isMuted) return;
-    conversation.setMuted(false);
+    setMute(false);
     setLiveText("");
     const speechWindow = window as CaptionWindow;
     const SR = speechWindow.webkitSpeechRecognition || speechWindow.SpeechRecognition;
@@ -248,7 +291,7 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
 
   function finishAnswer() {
     stopUserActivity();
-    conversation.setMuted(true);
+    setMute(true);
     stopCaptions();
   }
 
@@ -288,7 +331,7 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
           <h2 className="text-lg font-semibold">Voice interview</h2>
           <p className="text-sm text-muted-foreground">
             {phase === "ready" &&
-              "Talk with an AI interviewer. Same 6 questions as the text interview, based on what you sent."}
+              "Practise six core topics from your application, with follow-up questions based on your answers."}
             {phase === "preparing" && "Preparing your questions and connecting…"}
             {phase === "live" &&
               (conversation.isSpeaking
@@ -296,9 +339,7 @@ function VoiceCall({ app, onUseText, onFeedback, resetMute }: Props & { resetMut
                 : conversation.isMuted
                   ? "Microphone off. Take your time, then press Start answer."
                   : "Microphone on — press Done when you finish.") +
-                (plan.length
-                  ? ` · ${Math.min(answered, plan.length)} of ${plan.length} answered`
-                  : "")}
+                (answered ? ` · ${answered} response${answered === 1 ? "" : "s"} recorded` : "")}
             {phase === "ended" &&
               (answered
                 ? "Call ended. Get your feedback on the answers you gave."

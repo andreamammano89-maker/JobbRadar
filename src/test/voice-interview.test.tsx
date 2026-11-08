@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   speaking: false,
   onMutedChange: undefined as undefined | ((muted: boolean) => void),
   callbacks: {} as {
+    onConnect?: () => void;
     onMessage?: (value: { message: string; source: string }) => void;
     onDisconnect?: () => void;
     onError?: (message: string) => void;
@@ -93,7 +94,9 @@ async function connect(
   media.mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] });
   mocks.getVoiceSignedUrl.mockResolvedValue({ signed_url: "wss://example.invalid/test" });
   mocks.startInterview.mockResolvedValue({ message: "First question", plan: interview.plan });
-  mocks.startSession.mockResolvedValue("test-call");
+  mocks.startSession.mockImplementation(() => {
+    queueMicrotask(() => mocks.callbacks.onConnect?.());
+  });
   const view = render(<VoiceInterview {...props} />);
   fireEvent.click(screen.getByRole("button", { name: "Start voice interview" }));
   await screen.findByRole("button", { name: "Start answer" });
@@ -101,6 +104,67 @@ async function connect(
 }
 
 describe("Voice connection recovery", () => {
+  it("waits for onConnect when startSession returns void, without muting an inactive SDK session", async () => {
+    media.mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] });
+    mocks.getVoiceSignedUrl.mockResolvedValue({ signed_url: "wss://example.invalid/test" });
+    mocks.startInterview.mockResolvedValue({ message: "First question", plan: interview.plan });
+    mocks.startSession.mockReturnValue(undefined);
+    mocks.setMuted.mockImplementation(() => {
+      throw new Error("No active conversation. Call startSession() first.");
+    });
+    render(
+      <VoiceInterview app={fixture as ApplicationOut} onUseText={vi.fn()} onFeedback={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start voice interview" }));
+    await waitFor(() => expect(mocks.startSession).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "Start answer" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/No active conversation/)).not.toBeInTheDocument();
+    act(() => mocks.callbacks.onConnect?.());
+    expect(await screen.findByRole("button", { name: "Start answer" })).toBeEnabled();
+    expect(mocks.setMuted).not.toHaveBeenCalled();
+    expect(mocks.muted).toBe(true);
+  });
+
+  it("allows retry if the connection never becomes ready", async () => {
+    vi.useFakeTimers();
+    media.mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] });
+    mocks.getVoiceSignedUrl.mockResolvedValue({ signed_url: "wss://example.invalid/test" });
+    mocks.startInterview.mockResolvedValue({ message: "First question", plan: interview.plan });
+    mocks.startSession.mockReturnValue(undefined);
+    render(
+      <VoiceInterview app={fixture as ApplicationOut} onUseText={vi.fn()} onFeedback={vi.fn()} />,
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Start voice interview" })),
+    );
+    act(() => vi.advanceTimersByTime(30000));
+    expect(screen.getByText(/voice connection timed out/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start voice interview" })).toBeEnabled();
+    expect(mocks.endSession).toHaveBeenCalledOnce();
+    act(() => mocks.callbacks.onConnect?.());
+    expect(screen.queryByRole("button", { name: "Start answer" })).not.toBeInTheDocument();
+    expect(screen.getByText(/voice connection timed out/i)).toBeInTheDocument();
+  });
+
+  it("does not open a late connection after the page is unmounted", async () => {
+    media.mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] });
+    let resolveUrl: (value: { signed_url: string }) => void = () => {};
+    mocks.getVoiceSignedUrl.mockReturnValue(
+      new Promise((resolve) => {
+        resolveUrl = resolve;
+      }),
+    );
+    const view = render(
+      <VoiceInterview app={fixture as ApplicationOut} onUseText={vi.fn()} onFeedback={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start voice interview" }));
+    await waitFor(() => expect(mocks.getVoiceSignedUrl).toHaveBeenCalledOnce());
+    view.unmount();
+    await act(async () => resolveUrl({ signed_url: "wss://example.invalid/test" }));
+    expect(mocks.startInterview).not.toHaveBeenCalled();
+    expect(mocks.startSession).not.toHaveBeenCalled();
+  });
+
   it("keeps the call active across rerenders and ends it on unmount", async () => {
     const view = await connect();
     act(() => mocks.callbacks.onMessage?.({ message: "My answer", source: "user" }));
@@ -165,7 +229,9 @@ describe("Voice connection recovery", () => {
       message: "Tell me about yourself",
       plan: [{ id: 1, question: "Tell me about yourself" }],
     });
-    mocks.startSession.mockRejectedValue(new Error("Connection refused"));
+    mocks.startSession.mockImplementation(() => {
+      queueMicrotask(() => mocks.callbacks.onError?.("Connection refused"));
+    });
     render(
       <VoiceInterview app={fixture as ApplicationOut} onUseText={vi.fn()} onFeedback={vi.fn()} />,
     );
@@ -183,14 +249,14 @@ describe("Voice connection recovery", () => {
   it("starts muted, prevents talking over the agent and works without browser captions", async () => {
     mocks.speaking = true;
     const { rerender, props } = await connect();
-    expect(mocks.setMuted).toHaveBeenLastCalledWith(true);
+    expect(mocks.muted).toBe(true);
     expect(screen.getByRole("button", { name: "Start answer" })).toBeDisabled();
     mocks.speaking = false;
     rerender(<VoiceInterview {...props} />);
     fireEvent.click(screen.getByRole("button", { name: "Start answer" }));
-    expect(mocks.setMuted).toHaveBeenLastCalledWith(false);
+    expect(mocks.muted).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
-    expect(mocks.setMuted).toHaveBeenLastCalledWith(true);
+    expect(mocks.muted).toBe(true);
     expect(screen.queryByRole("status", { name: "Your live captions" })).not.toBeInTheDocument();
   });
 
